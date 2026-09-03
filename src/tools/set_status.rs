@@ -77,6 +77,23 @@ pub enum StatusKind {
     Outcome,
 }
 
+/// Structured verification evidence carried by an `outcome` status.
+///
+/// "No test evidence, no done": an outcome is only accepted when it
+/// documents what was actually run — at least one item with a command and
+/// its exit code. A failed task documents its failing command; a successful
+/// task documents the passing run (e.g. `cargo test --lib`, exit 0).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Evidence {
+    /// The command that produced the evidence (e.g. `cargo test --lib`).
+    pub command: String,
+    /// The command's exit code (0 = success).
+    pub exit_code: i32,
+    /// Optional human-readable summary (e.g. "42 passed, 0 failed").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
 /// Arguments for set status tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetStatusArgs {
@@ -86,6 +103,10 @@ pub struct SetStatusArgs {
     /// updates, "outcome" when the task has reached a terminal result.
     #[serde(default)]
     pub kind: StatusKind,
+    /// Verification evidence (command + exit code) for an `outcome` status.
+    /// Required when `kind` is `outcome`; ignored for `progress`.
+    #[serde(default)]
+    pub evidence: Option<Vec<Evidence>>,
 }
 
 /// Output from set status tool.
@@ -104,6 +125,10 @@ pub struct SetStatusOutput {
     pub outcome: Option<String>,
     /// The kind of status that was set.
     pub kind: StatusKind,
+    /// The evidence carried by this outcome (present when `kind` is
+    /// `outcome`), so callers can verify the completion gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Vec<Evidence>>,
 }
 
 impl Tool for SetStatusTool {
@@ -129,6 +154,19 @@ impl Tool for SetStatusTool {
                         "enum": ["progress", "outcome"],
                         "default": "progress",
                         "description": "Use \"progress\" for intermediate updates. Use \"outcome\" ONLY when ALL steps of the task have reached a terminal result (success or failure) and you are ready to finish. Do not signal outcome if there are remaining steps — premature outcome signaling causes the task to be incorrectly reported as complete."
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "command": { "type": "string", "description": "The command that produced the evidence" },
+                                "exit_code": { "type": "integer", "description": "The command's exit code (0 = success)" },
+                                "summary": { "type": "string", "description": "Optional summary, e.g. '42 tests passed'" }
+                            },
+                            "required": ["command", "exit_code"]
+                        },
+                        "description": "REQUIRED for kind=\"outcome\": at least one item documenting the command you ran and its exit code (e.g. cargo test --lib with exit_code 0). Text-only outcomes are rejected."
                     }
                 },
                 "required": ["status"]
@@ -160,6 +198,33 @@ impl Tool for SetStatusTool {
         // completion path can deliver it, while the capped form feeds the
         // live status stream.
         let outcome = (args.kind == StatusKind::Outcome).then_some(scrubbed);
+        let evidence = if args.kind == StatusKind::Outcome {
+            args.evidence.clone()
+        } else {
+            None
+        };
+
+        // "No test evidence, no done": an outcome must document what was
+        // actually run. Rejecting here gives the worker immediate feedback
+        // (it can retry in the same turn); the hook's gate stays as
+        // defense-in-depth for anything that bypasses the tool.
+        if args.kind == StatusKind::Outcome {
+            let has_evidence = args
+                .evidence
+                .as_ref()
+                .map(|items| {
+                    !items.is_empty() && items.iter().all(|item| !item.command.trim().is_empty())
+                })
+                .unwrap_or(false);
+            if !has_evidence {
+                return Err(SetStatusError(
+                    "outcome requires evidence: pass evidence: [{ command, exit_code }, ...] \
+                     documenting the command you ran and its exit code \
+                     (e.g. { command: \"cargo test --lib\", exit_code: 0 })"
+                        .into(),
+                ));
+            }
+        }
 
         if args.kind == StatusKind::Outcome && !self.interactive {
             match self
@@ -199,6 +264,7 @@ impl Tool for SetStatusTool {
             status,
             outcome,
             kind: args.kind,
+            evidence,
         })
     }
 }
@@ -222,7 +288,7 @@ pub fn set_status(
 
 #[cfg(test)]
 mod tests {
-    use super::{SetStatusArgs, SetStatusTool, StatusKind};
+    use super::{Evidence, SetStatusArgs, SetStatusTool, StatusKind};
     use crate::conversation::{
         ProcessRunLogger, WorkerLifecycle, WorkerOutcomeKind, WorkerTerminalOwner,
         WorkerTransitionResult,
@@ -276,12 +342,19 @@ mod tests {
             .call(SetStatusArgs {
                 status: long.clone(),
                 kind: StatusKind::Outcome,
+                evidence: Some(vec![Evidence {
+                    command: "cargo test --lib".to_string(),
+                    exit_code: 0,
+                    summary: Some("42 passed".to_string()),
+                }]),
             })
             .await
             .unwrap();
         assert_eq!(output.outcome.as_deref(), Some(long.as_str()));
         assert!(output.status.len() <= 260);
         assert!(output.status.ends_with("..."));
+        // Evidence rides along in the output.
+        assert_eq!(output.evidence.as_ref().map(|items| items.len()), Some(1));
     }
 
     #[tokio::test]
@@ -291,10 +364,83 @@ mod tests {
             .call(SetStatusArgs {
                 status: "working on it".to_string(),
                 kind: StatusKind::Progress,
+                evidence: None,
             })
             .await
             .unwrap();
         assert!(output.outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn outcome_without_evidence_is_rejected() {
+        let (tool, _logger, _worker_id) = setup(false).await;
+        // Text-only outcome: no evidence -> rejected, so the hook's gate
+        // never sees `outcome_signaled` and the worker gets nudged.
+        let error = tool
+            .call(SetStatusArgs {
+                status: "all done".to_string(),
+                kind: StatusKind::Outcome,
+                evidence: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.0.contains("requires evidence"));
+        // Empty evidence list is also rejected.
+        let error = tool
+            .call(SetStatusArgs {
+                status: "all done".to_string(),
+                kind: StatusKind::Outcome,
+                evidence: Some(vec![]),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.0.contains("requires evidence"));
+        // An item with a blank command is rejected too.
+        let error = tool
+            .call(SetStatusArgs {
+                status: "all done".to_string(),
+                kind: StatusKind::Outcome,
+                evidence: Some(vec![Evidence {
+                    command: "  ".to_string(),
+                    exit_code: 0,
+                    summary: None,
+                }]),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.0.contains("requires evidence"));
+        // Progress updates never need evidence.
+        let output = tool
+            .call(SetStatusArgs {
+                status: "still working".to_string(),
+                kind: StatusKind::Progress,
+                evidence: None,
+            })
+            .await
+            .unwrap();
+        assert!(output.evidence.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_task_evidence_is_accepted() {
+        let (tool, _logger, _worker_id) = setup(false).await;
+        // A failing command is still evidence — it documents what ran.
+        let output = tool
+            .call(SetStatusArgs {
+                status: "Build failed: 3 type errors in auth module".to_string(),
+                kind: StatusKind::Outcome,
+                evidence: Some(vec![Evidence {
+                    command: "cargo build".to_string(),
+                    exit_code: 1,
+                    summary: Some("3 errors".to_string()),
+                }]),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            output.evidence.as_ref().map(|items| items[0].exit_code),
+            Some(1)
+        );
     }
 
     #[tokio::test]
@@ -303,6 +449,11 @@ mod tests {
         let args = || SetStatusArgs {
             status: "finished".to_string(),
             kind: StatusKind::Outcome,
+            evidence: Some(vec![Evidence {
+                command: "cargo test --lib".to_string(),
+                exit_code: 0,
+                summary: None,
+            }]),
         };
         assert!(tool.call(args()).await.is_ok());
         assert!(tool.call(args()).await.is_ok());
@@ -318,6 +469,11 @@ mod tests {
         tool.call(SetStatusArgs {
             status: "finished".to_string(),
             kind: StatusKind::Outcome,
+            evidence: Some(vec![Evidence {
+                command: "cargo test --lib".to_string(),
+                exit_code: 0,
+                summary: None,
+            }]),
         })
         .await
         .unwrap();
@@ -364,6 +520,11 @@ mod tests {
         tool.call(SetStatusArgs {
             status: "turn complete".to_string(),
             kind: StatusKind::Outcome,
+            evidence: Some(vec![Evidence {
+                command: "cargo test --lib".to_string(),
+                exit_code: 0,
+                summary: None,
+            }]),
         })
         .await
         .unwrap();

@@ -88,8 +88,10 @@ struct ReplyToolDeltaState {
 impl SpacebotHook {
     /// Prompt used to nudge tool-first behavior.
     pub const TOOL_NUDGE_PROMPT: &str = "You have not completed the task yet. Continue working using the available tools. \
-         When you have reached a final result, call set_status with kind \"outcome\" \
-         before finishing.";
+         When you have reached a final result, call set_status with kind \"outcome\" and \
+         attach evidence — the command you ran and its exit code (e.g. \
+         evidence: [{ command: \"cargo test --lib\", exit_code: 0 }]). A text-only outcome \
+         is not accepted: no test evidence, no done.";
     /// PromptCancelled reason used internally for tool nudge retries.
     pub const TOOL_NUDGE_REASON: &str = "spacebot_tool_nudge_retry";
     /// PromptCancelled reason used when injected context is pending.
@@ -1490,6 +1492,17 @@ where
             && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(result)
             && parsed.get("success").and_then(|v| v.as_bool()) == Some(true)
             && parsed.get("kind").and_then(|v| v.as_str()) == Some("outcome")
+            // "No test evidence, no done": an outcome only counts when it
+            // carries at least one evidence item with a real command. This is
+            // defense-in-depth — the tool already rejects evidence-less
+            // outcomes, so a successful result should always carry evidence.
+            && let Some(evidence) = parsed.get("evidence").and_then(|v| v.as_array())
+            && !evidence.is_empty()
+            && evidence.iter().all(|item| {
+                item.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|command| !command.trim().is_empty())
+            })
         {
             if let Some(text) = parsed
                 .get("outcome")
@@ -1721,7 +1734,7 @@ mod tests {
             "set_status",
             None,
             "internal_2",
-            "{\"status\":\"Email sent successfully\",\"kind\":\"outcome\"}",
+            "{\"status\":\"Email sent successfully\",\"kind\":\"outcome\",\"evidence\":[{\"command\":\"cargo test --lib\",\"exit_code\":0}]}",
         )
         .await;
         let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
@@ -1729,8 +1742,8 @@ mod tests {
             "set_status",
             None,
             "internal_2",
-            "{\"status\":\"Email sent successfully\",\"kind\":\"outcome\"}",
-            "{\"success\":true,\"worker_id\":1,\"status\":\"Email sent successfully\",\"kind\":\"outcome\"}",
+            "{\"status\":\"Email sent successfully\",\"kind\":\"outcome\",\"evidence\":[{\"command\":\"cargo test --lib\",\"exit_code\":0}]}",
+            "{\"success\":true,\"worker_id\":1,\"status\":\"Email sent successfully\",\"kind\":\"outcome\",\"evidence\":[{\"command\":\"cargo test --lib\",\"exit_code\":0}]}",
         )
         .await;
 
@@ -1758,8 +1771,8 @@ mod tests {
             "set_status",
             None,
             "internal_1",
-            "{\"status\":\"finished\",\"kind\":\"outcome\"}",
-            "{\"success\":true,\"worker_id\":1,\"status\":\"finished\",\"kind\":\"outcome\"}",
+            "{\"status\":\"finished\",\"kind\":\"outcome\",\"evidence\":[{\"command\":\"cargo test --lib\",\"exit_code\":0}]}",
+            "{\"success\":true,\"worker_id\":1,\"status\":\"finished\",\"kind\":\"outcome\",\"evidence\":[{\"command\":\"cargo test --lib\",\"exit_code\":0}]}",
         )
         .await;
 
@@ -1771,6 +1784,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evidence_less_outcome_does_not_signal() {
+        let hook = make_hook().with_tool_nudge_policy(ToolNudgePolicy::Enabled);
+        // A result that somehow slipped through without evidence must NOT
+        // count: the worker still gets nudged instead of completing.
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "set_status",
+            None,
+            "internal_1",
+            "{\"status\":\"finished\",\"kind\":\"outcome\"}",
+            "{\"success\":true,\"worker_id\":1,\"status\":\"finished\",\"kind\":\"outcome\"}",
+        )
+        .await;
+        assert!(!hook.outcome_signaled());
+        assert!(hook.take_outcome_text().is_none());
+
+        // Empty evidence array also does not count.
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "set_status",
+            None,
+            "internal_1",
+            "{\"status\":\"finished\",\"kind\":\"outcome\"}",
+            "{\"success\":true,\"worker_id\":1,\"status\":\"finished\",\"kind\":\"outcome\",\"evidence\":[]}",
+        )
+        .await;
+        assert!(!hook.outcome_signaled());
+
+        // An item with a blank command does not count either.
+        let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
+            &hook,
+            "set_status",
+            None,
+            "internal_1",
+            "{\"status\":\"finished\",\"kind\":\"outcome\"}",
+            "{\"success\":true,\"worker_id\":1,\"status\":\"finished\",\"kind\":\"outcome\",\"evidence\":[{\"command\":\"  \",\"exit_code\":0}]}",
+        )
+        .await;
+        assert!(!hook.outcome_signaled());
+    }
+
+    #[tokio::test]
     async fn outcome_signal_retains_full_outcome_text() {
         let hook = make_hook().with_tool_nudge_policy(ToolNudgePolicy::Enabled);
         let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
@@ -1778,8 +1833,8 @@ mod tests {
             "set_status",
             None,
             "internal_1",
-            "{\"status\":\"Console verified\",\"kind\":\"outcome\"}",
-            "{\"success\":true,\"worker_id\":1,\"status\":\"Console verified...\",\"outcome\":\"Console verified at http://127.0.0.1:4100 with PID 19671\",\"kind\":\"outcome\"}",
+            "{\"status\":\"Console verified\",\"kind\":\"outcome\",\"evidence\":[{\"command\":\"curl -s http://127.0.0.1:4100\",\"exit_code\":0}]}",
+            "{\"success\":true,\"worker_id\":1,\"status\":\"Console verified...\",\"outcome\":\"Console verified at http://127.0.0.1:4100 with PID 19671\",\"kind\":\"outcome\",\"evidence\":[{\"command\":\"curl -s http://127.0.0.1:4100\",\"exit_code\":0}]}",
         )
         .await;
 
@@ -1799,8 +1854,8 @@ mod tests {
             "set_status",
             None,
             "internal_1",
-            "{\"status\":\"done\",\"kind\":\"outcome\"}",
-            "{\"success\":true,\"worker_id\":1,\"status\":\"done\",\"outcome\":\"done\",\"kind\":\"outcome\"}",
+            "{\"status\":\"done\",\"kind\":\"outcome\",\"evidence\":[{\"command\":\"cargo test --lib\",\"exit_code\":0}]}",
+            "{\"success\":true,\"worker_id\":1,\"status\":\"done\",\"outcome\":\"done\",\"kind\":\"outcome\",\"evidence\":[{\"command\":\"cargo test --lib\",\"exit_code\":0}]}",
         )
         .await;
 

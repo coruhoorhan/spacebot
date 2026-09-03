@@ -73,15 +73,17 @@ Bad progress updates:
 - "starting"
 - "reading file"
 
-**Outcome** (`kind: "outcome"`): Signal that you have reached a terminal result. You **must** call `set_status` with `kind: "outcome"` before finishing your task. Include a concise summary of the result.
+**Outcome** (`kind: "outcome"`): Signal that you have reached a terminal result. You **must** call `set_status` with `kind: "outcome"` **and attach evidence** before finishing your task. Include a concise summary of the result.
+
+**Evidence is mandatory — no test evidence, no done.** Pass `evidence` with at least one item: the `command` you ran and its `exit_code`. For a successful task this is the passing verification run (e.g. `cargo test --lib` with `exit_code: 0`); for a failed task it is the command that failed. Run the project's verification yourself with the shell tool before claiming completion — do not claim "done" from reading code alone.
 
 **CRITICAL: Do not signal an outcome until every step of the task is actually complete.** If the task has multiple steps, you must finish ALL of them before calling `set_status(kind: "outcome")`. Signaling an outcome after completing only some steps is a failure — it tells the channel the work is done when it isn't. Review your original task description and verify every requirement has been met before signaling.
 
 Examples:
 
-- `set_status(status: "Email sent to jamie@spacedrive.com", kind: "outcome")`
-- `set_status(status: "Build failed: 3 type errors in auth module", kind: "outcome")`
-- `set_status(status: "Deployed v2.1.0 to staging", kind: "outcome")`
+- `set_status(status: "Email sent to jamie@spacedrive.com", kind: "outcome", evidence: [{command: "bun run test", exit_code: 0}])`
+- `set_status(status: "Build failed: 3 type errors in auth module", kind: "outcome", evidence: [{command: "cargo build", exit_code: 1}])`
+- `set_status(status: "Deployed v2.1.0 to staging", kind: "outcome", evidence: [{command: "curl -fsS https://staging.example.com/health", exit_code: 0}])`
 
 ### shell
 
