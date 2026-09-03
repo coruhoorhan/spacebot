@@ -1734,7 +1734,7 @@ mod tests {
             "set_status",
             None,
             "internal_2",
-            "{\"status\":\"Email sent successfully\",\"kind\":\"outcome\"}",
+            "{\"status\":\"Email sent successfully\",\"kind\":\"outcome\",\"evidence\":[{\"command\":\"cargo test --lib\",\"exit_code\":0}]}",
         )
         .await;
         let _ = <SpacebotHook as PromptHook<SpacebotModel>>::on_tool_result(
@@ -1742,8 +1742,8 @@ mod tests {
             "set_status",
             None,
             "internal_2",
-            "{\"status\":\"Email sent successfully\",\"kind\":\"outcome\"}",
-            "{\"success\":true,\"worker_id\":1,\"status\":\"Email sent successfully\",\"kind\":\"outcome\"}",
+            "{\"status\":\"Email sent successfully\",\"kind\":\"outcome\",\"evidence\":[{\"command\":\"cargo test --lib\",\"exit_code\":0}]}",
+            "{\"success\":true,\"worker_id\":1,\"status\":\"Email sent successfully\",\"kind\":\"outcome\",\"evidence\":[{\"command\":\"cargo test --lib\",\"exit_code\":0}]}",
         )
         .await;
 
